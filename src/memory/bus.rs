@@ -2053,7 +2053,15 @@ impl MacMemoryBus {
             && fb_write_trace_range().is_none()
             && self.write_probe_original.is_none();
         #[cfg(not(debug_assertions))]
-        let fast = fb_write_trace_range().is_none() && self.write_probe_original.is_none();
+        // The memory range trace must see span fills too. `fill_bytes` and
+        // `fill_bytes_strided` are what `fb_hline` and `fb_fill_rect` use for
+        // 8-bit runs, so watching a screen row through
+        // SYSTEMLESS_TRACE_MEM_WRITE_RANGE reported silence while the frame
+        // plainly changed -- and silence from a diagnostic reads as proof of
+        // absence, which is how a dialog-frame investigation lost an afternoon.
+        let fast = fb_write_trace_range().is_none()
+            && mem_write_trace_range().is_none()
+            && self.write_probe_original.is_none();
         let translated_src = self.range_translates_contiguously(src, len as usize);
         let translated_dst = self.range_translates_contiguously(dst, len as usize);
         let src = translated_src.unwrap_or(src);
@@ -2109,7 +2117,15 @@ impl MacMemoryBus {
             && fb_write_trace_range().is_none()
             && self.write_probe_original.is_none();
         #[cfg(not(debug_assertions))]
-        let fast = fb_write_trace_range().is_none() && self.write_probe_original.is_none();
+        // The memory range trace must see span fills too. `fill_bytes` and
+        // `fill_bytes_strided` are what `fb_hline` and `fb_fill_rect` use for
+        // 8-bit runs, so watching a screen row through
+        // SYSTEMLESS_TRACE_MEM_WRITE_RANGE reported silence while the frame
+        // plainly changed -- and silence from a diagnostic reads as proof of
+        // absence, which is how a dialog-frame investigation lost an afternoon.
+        let fast = fb_write_trace_range().is_none()
+            && mem_write_trace_range().is_none()
+            && self.write_probe_original.is_none();
         let translated_src = self.range_translates_contiguously(src, len as usize);
         let translated_dst = self.range_translates_contiguously(dst, len as usize);
         let src = translated_src.unwrap_or(src);
@@ -2801,7 +2817,15 @@ impl MemoryBus for MacMemoryBus {
             && fb_write_trace_range().is_none()
             && self.write_probe_original.is_none();
         #[cfg(not(debug_assertions))]
-        let fast = fb_write_trace_range().is_none() && self.write_probe_original.is_none();
+        // The memory range trace must see span fills too. `fill_bytes` and
+        // `fill_bytes_strided` are what `fb_hline` and `fb_fill_rect` use for
+        // 8-bit runs, so watching a screen row through
+        // SYSTEMLESS_TRACE_MEM_WRITE_RANGE reported silence while the frame
+        // plainly changed -- and silence from a diagnostic reads as proof of
+        // absence, which is how a dialog-frame investigation lost an afternoon.
+        let fast = fb_write_trace_range().is_none()
+            && mem_write_trace_range().is_none()
+            && self.write_probe_original.is_none();
         let translated_address = translated.unwrap_or(address);
         let end = (translated_address as u64).saturating_add(len as u64);
         if translated.is_some() && end <= self.ram_size as u64 {
@@ -2846,7 +2870,15 @@ impl MemoryBus for MacMemoryBus {
             && fb_write_trace_range().is_none()
             && self.write_probe_original.is_none();
         #[cfg(not(debug_assertions))]
-        let fast = fb_write_trace_range().is_none() && self.write_probe_original.is_none();
+        // The memory range trace must see span fills too. `fill_bytes` and
+        // `fill_bytes_strided` are what `fb_hline` and `fb_fill_rect` use for
+        // 8-bit runs, so watching a screen row through
+        // SYSTEMLESS_TRACE_MEM_WRITE_RANGE reported silence while the frame
+        // plainly changed -- and silence from a diagnostic reads as proof of
+        // absence, which is how a dialog-frame investigation lost an afternoon.
+        let fast = fb_write_trace_range().is_none()
+            && mem_write_trace_range().is_none()
+            && self.write_probe_original.is_none();
         if fast && span <= u64::from(u32::MAX) {
             if let Some(start) = self.range_translates_contiguously(address, span as usize) {
                 let end = u64::from(start) + span;
@@ -2886,7 +2918,15 @@ impl MemoryBus for MacMemoryBus {
             && fb_write_trace_range().is_none()
             && self.write_probe_original.is_none();
         #[cfg(not(debug_assertions))]
-        let fast = fb_write_trace_range().is_none() && self.write_probe_original.is_none();
+        // The memory range trace must see span fills too. `fill_bytes` and
+        // `fill_bytes_strided` are what `fb_hline` and `fb_fill_rect` use for
+        // 8-bit runs, so watching a screen row through
+        // SYSTEMLESS_TRACE_MEM_WRITE_RANGE reported silence while the frame
+        // plainly changed -- and silence from a diagnostic reads as proof of
+        // absence, which is how a dialog-frame investigation lost an afternoon.
+        let fast = fb_write_trace_range().is_none()
+            && mem_write_trace_range().is_none()
+            && self.write_probe_original.is_none();
         let translated_address = translated.unwrap_or(address);
         let end = (translated_address as u64).saturating_add(len as u64);
         if translated.is_some() && end <= self.ram_size as u64 {
