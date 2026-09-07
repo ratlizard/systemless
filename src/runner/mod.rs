@@ -9456,6 +9456,33 @@ impl FixtureRunner {
         {
             return false;
         }
+        // A WaitNextEvent sleep relinquishes the processor to *other
+        // processes* -- "the amount of time your application is willing to
+        // relinquish the processor if no events are pending", to "allow
+        // background processes to receive processing time" (Macintosh
+        // Toolbox Essentials 1992, p. 2-88). The runner hosts one
+        // application and no background processes, so it treats the sleep as
+        // idle time and advances the clock across it without executing guest
+        // code. That is right only while the application has nothing to do.
+        //
+        // An application with a ready cooperative thread does have something
+        // to do, and idling the sleep away starves it: Cythera's event loop
+        // yields to its loader and animation threads immediately after
+        // WaitNextEvent returns, so the thread advances one slice per sleep
+        // rather than for the duration of one. Measured on the headless
+        // inventory probe: 75,209 sleeps of 3 ticks in a 280M-instruction
+        // run, a thread ready at every one of them, 225,621 of the run's
+        // 346,912 ticks spent idling past ready work.
+        //
+        // So the sleep is honoured only when the application is genuinely
+        // idle. With a thread ready the null event is delivered at once --
+        // what an application that owns threads gets by passing sleep 0 --
+        // and the application's own scheduler dispatches the thread.
+        if self.dispatcher.guest_calls.next_ready_task(None).is_some() {
+            self.dispatcher.pending_wait_sleep_ticks = 0;
+            self.dispatcher.pending_wait_next_event_return = None;
+            return false;
+        }
 
         if self.frozen_ticks.is_some() {
             self.dispatcher.pending_wait_sleep_ticks = 0;
@@ -27088,6 +27115,88 @@ mod tests {
         );
         assert_eq!(runner.bus.read_long(0x016A), 10);
         assert_eq!(runner.dispatcher.pending_wait_sleep_ticks, 50);
+    }
+
+    /// Build a runner parked in a WaitNextEvent sleep, as the trap handler
+    /// leaves it: the null event already written, the guest at the
+    /// instruction after the trap, and the sleep owed to the runner.
+    fn runner_parked_in_wait_sleep(sleep_ticks: u32) -> (FixtureRunner, u32) {
+        let mut runner = FixtureRunner::new(8 * 1024 * 1024, FixtureRunnerConfig::default());
+        let program_start = 0x0001_0000;
+        let event_ptr = 0x0020_0000;
+        let result_ptr = 0x0020_0020;
+
+        runner.bus.write_word(program_start, 0x4E71);
+        runner.m68k.cpu.write_reg(Register::PC, program_start);
+        runner.m68k.cpu.write_reg(Register::A7, 0x007F_FFC0);
+        runner.bus.write_long(0x016A, 0);
+        runner.bus.write_word(result_ptr, 0);
+        runner.dispatcher.set_sent_open_app_event_for_test(true);
+        runner
+            .dispatcher
+            .write_event_record(&mut runner.bus, event_ptr, 0, 0, 0, 0, 0, 0);
+        runner.dispatcher.pending_wait_sleep_ticks = sleep_ticks;
+        runner.dispatcher.pending_wait_next_event_return = Some(PendingWaitNextEventReturn {
+            event_ptr,
+            result_ptr,
+            event_mask: 0xFFFF,
+            mouse_rgn: 0,
+            resume_pc: None,
+            resume_sp: None,
+        });
+        (runner, program_start)
+    }
+
+    #[test]
+    fn wait_next_event_sleep_is_idled_away_when_the_application_has_no_ready_thread() {
+        // The sleep relinquishes the processor, and with nothing else to run
+        // the runner advances the clock across it instead of executing guest
+        // code. Macintosh Toolbox Essentials 1992, p. 2-88.
+        let (mut runner, _) = runner_parked_in_wait_sleep(30);
+        let tick_before = runner.guest_tick();
+
+        let (_steps, running) = runner.run_steps(64, None);
+
+        assert!(running);
+        assert_eq!(
+            runner.guest_tick() - tick_before,
+            30,
+            "the whole sleep is spent before the guest runs again"
+        );
+        assert_eq!(runner.dispatcher.pending_wait_sleep_ticks, 0);
+    }
+
+    #[test]
+    fn wait_next_event_sleep_yields_to_a_ready_cooperative_thread_instead_of_idling() {
+        // A ready thread is work the application has to do, so the sleep is
+        // not idle time: the null event is delivered at once and the guest
+        // runs, as it would had the application passed sleep 0. Idling here
+        // starved Cythera's loader thread and inflated the guest clock --
+        // 225,621 of 346,912 ticks in the headless inventory probe.
+        use crate::execution_kernel::ExecutionTaskState;
+        let (mut runner, _) = runner_parked_in_wait_sleep(30);
+        let worker = runner
+            .dispatcher
+            .guest_calls
+            .create_task()
+            .expect("a second cooperative task");
+        assert!(runner
+            .dispatcher
+            .guest_calls
+            .set_scheduling_state(worker, ExecutionTaskState::Ready));
+        let tick_before = runner.guest_tick();
+
+        let (steps, running) = runner.run_steps(4, None);
+
+        assert!(running);
+        assert!(steps > 0, "the guest runs instead of idling the sleep away");
+        assert_eq!(
+            runner.guest_tick(),
+            tick_before,
+            "no clock is invented for work that was not idle"
+        );
+        assert_eq!(runner.dispatcher.pending_wait_sleep_ticks, 0);
+        assert!(runner.dispatcher.pending_wait_next_event_return.is_none());
     }
 
     #[test]
