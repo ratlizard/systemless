@@ -9596,20 +9596,22 @@ impl FixtureRunner {
         // idle. With a thread ready the null event is delivered at once --
         // what an application that owns threads gets by passing sleep 0 --
         // and the application's own scheduler dispatches the thread.
-        // Spend one tick of it and let the guest have that tick, rather than
-        // spending the whole sleep at once with nothing running. The
-        // application's event loop keeps the rate its sleep asks for -- the
-        // clock still moves a tick per pass -- and its threads get the time
-        // instead of nobody. The budget is deliberately not refilled: a
-        // refill here lets an application whose thread is always ready spin
-        // its event loop at the full instruction budget, which is what an
-        // idle start screen did when this skipped the sleep outright.
+        // The null event is delivered at once, as an application that owns
+        // threads gets by passing sleep 0, and the game's own scheduler
+        // dispatches the thread.
+        //
+        // Spending the sleep a tick at a time instead was tried, to stop an
+        // application whose thread is always ready from running its event
+        // loop at the full instruction budget. It cost a pass through the run
+        // loop for every tick of every sleep and made the 280M inventory
+        // probe 100 s against 33 s, and the idle it was meant to protect
+        // turned out to be a measuring mistake: the harness drove the guest
+        // to its deadline every tick, so it filled every tick whatever this
+        // did. Skipping is both faster and the honest reading -- an
+        // application with work to do is not idle.
         if self.dispatcher.guest_calls.next_ready_task(None).is_some() {
-            self.dispatcher.pending_wait_sleep_ticks -= 1;
-            self.advance_guest_tick_from(&TS_WAIT_SLEEP);
-            if self.dispatcher.pending_wait_sleep_ticks == 0 {
-                self.dispatcher.pending_wait_next_event_return = None;
-            }
+            self.dispatcher.pending_wait_sleep_ticks = 0;
+            self.dispatcher.pending_wait_next_event_return = None;
             return false;
         }
 
@@ -29118,11 +29120,10 @@ mod tests {
     #[test]
     fn wait_next_event_sleep_yields_to_a_ready_cooperative_thread_instead_of_idling() {
         // A ready thread is work the application has to do, so the sleep is
-        // not empty time: it is spent a tick at a time with the guest running
-        // for each, rather than all at once with nothing running. Spending it
-        // all at once starved Cythera's loader thread -- on the paced path
-        // whole host frames went by with the clock advancing and no guest
-        // code executed at all.
+        // not idle time and no clock is invented for it. Spending it whole
+        // with nothing running starved Cythera's loader thread: on the paced
+        // path whole host frames went by with the clock advancing and no
+        // guest code executed at all.
         use crate::execution_kernel::ExecutionTaskState;
         let (mut runner, _) = runner_parked_in_wait_sleep(30);
         let worker = runner
@@ -29137,19 +29138,15 @@ mod tests {
         let tick_before = runner.guest_tick();
 
         let (steps, running) = runner.run_steps(4, None);
-        let spent = runner.guest_tick() - tick_before;
 
         assert!(running);
         assert!(steps > 0, "the guest runs instead of idling the sleep away");
-        assert!(
-            spent > 0 && spent < 30,
-            "the sleep is spent a tick at a time, not all at once: {spent}"
-        );
         assert_eq!(
-            runner.dispatcher.pending_wait_sleep_ticks,
-            30 - spent,
-            "what is left of the sleep is what was not spent"
+            runner.guest_tick(),
+            tick_before,
+            "and no clock is invented for time the application did not idle"
         );
+        assert_eq!(runner.dispatcher.pending_wait_sleep_ticks, 0);
     }
 
     #[test]
