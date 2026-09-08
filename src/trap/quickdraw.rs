@@ -2098,6 +2098,19 @@ impl super::TrapDispatcher {
                         ch,
                     );
                 }
+                // A character drawn into an open picture is recorded, for the
+                // reason given on DrawText below.
+                if self.recording_picture.is_some() {
+                    let text = [ch as u8];
+                    let pen = self.pn_loc;
+                    let width = self.recorded_text_advance(&text);
+                    if let Some((_, _, _, _, _, commands)) = self.recording_picture.as_mut() {
+                        pict::recording_push_long_text(commands, pen.0, pen.1, &text);
+                    }
+                    self.pn_loc.1 = self.pn_loc.1.saturating_add(width);
+                    self.sync_current_port_draw_state(bus);
+                    return Some(Ok(()));
+                }
                 self.draw_char(cpu, bus, ch);
                 self.refresh_visible_dialog_snapshot_for_port(bus, *self.current_port);
                 Ok(())
@@ -2135,24 +2148,15 @@ impl super::TrapDispatcher {
                         String::from_utf8_lossy(&bytes),
                     );
                 }
-                if let Some((_, _, _, _, _, commands)) = self.recording_picture.as_mut() {
+                if self.recording_picture.is_some() {
                     let len = usize::from(bus.read_byte(str_ptr));
                     let text = bus.read_bytes(str_ptr + 1, len);
-                    pict::recording_push_long_text(commands, self.pn_loc.0, self.pn_loc.1, &text);
-                    let mut advance = 0i32;
-                    for &byte in &text {
-                        advance += if let Some((glyph, _)) =
-                            get_glyph(self.tx_font, self.tx_size, byte as char)
-                        {
-                            i32::from(self.glyph_advance(glyph))
-                        } else {
-                            i32::from(self.missing_glyph_advance())
-                        };
+                    let pen = self.pn_loc;
+                    let width = self.recorded_text_advance(&text);
+                    if let Some((_, _, _, _, _, commands)) = self.recording_picture.as_mut() {
+                        pict::recording_push_long_text(commands, pen.0, pen.1, &text);
                     }
-                    self.pn_loc.1 = self
-                        .pn_loc
-                        .1
-                        .saturating_add(self.proportional_text_width(advance));
+                    self.pn_loc.1 = self.pn_loc.1.saturating_add(width);
                     self.sync_current_port_draw_state(bus);
                     return Some(Ok(()));
                 }
@@ -2195,6 +2199,27 @@ impl super::TrapDispatcher {
                         self.tx_mode,
                         String::from_utf8_lossy(&bytes),
                     );
+                }
+                // Text drawn while a picture is open belongs in the picture,
+                // not on the port -- Inside Macintosh Volume I, I-189: between
+                // OpenPicture and ClosePicture "all calls to QuickDraw drawing
+                // routines are stored in the picture definition". DrawString
+                // below already did this and DrawText did not, so an
+                // application that draws its text a buffer at a time recorded
+                // the font state and none of the words. Cythera's papers are
+                // that case: eighteen DrawText calls inside one OpenPicture,
+                // and the scroll window drew an empty parchment.
+                if self.recording_picture.is_some() {
+                    let count = usize::try_from(byte_count).unwrap_or(0);
+                    let text = bus.read_bytes(start, count);
+                    let pen = self.pn_loc;
+                    let width = self.recorded_text_advance(&text);
+                    if let Some((_, _, _, _, _, commands)) = self.recording_picture.as_mut() {
+                        pict::recording_push_long_text(commands, pen.0, pen.1, &text);
+                    }
+                    self.pn_loc.1 = self.pn_loc.1.saturating_add(width);
+                    self.sync_current_port_draw_state(bus);
+                    return Some(Ok(()));
                 }
                 bus.begin_presentation_text_run(self.tx_mode == 0);
                 for i in 0..byte_count {
@@ -21804,6 +21829,22 @@ impl super::TrapDispatcher {
             bytes.push(packed.len() as u8);
         }
         bytes.extend_from_slice(&packed);
+    }
+
+    /// How far the pen moves for `text` in the current font, which is what a
+    /// recorded text opcode has to advance it by: the picture player will
+    /// place the following opcode from the pen this leaves behind.
+    fn recorded_text_advance(&self, text: &[u8]) -> i16 {
+        let mut advance = 0i32;
+        for &byte in text {
+            advance += if let Some((glyph, _)) = get_glyph(self.tx_font, self.tx_size, byte as char)
+            {
+                i32::from(self.glyph_advance(glyph))
+            } else {
+                i32::from(self.missing_glyph_advance())
+            };
+        }
+        self.proportional_text_width(advance)
     }
 
     fn encode_recorded_picture_pict(
@@ -48964,6 +49005,71 @@ mod tests {
             bus.read_bytes(screen_base, 4),
             vec![1, 2, 3, 4],
             "OpenPicture/CopyBits artwork must retain packed pixels and its indexed colors"
+        );
+    }
+
+    #[test]
+    fn drawtext_between_openpicture_and_closepicture_is_recorded_as_longtext() {
+        // Inside Macintosh Volume I, I-189: between OpenPicture and
+        // ClosePicture every QuickDraw drawing call goes into the picture.
+        // DrawString recorded and DrawText did not, so an application that
+        // draws its text a buffer at a time -- Cythera's papers do, eighteen
+        // DrawText calls inside one OpenPicture -- produced a picture holding
+        // the font state and not one glyph, and the window it was replayed
+        // into came out blank.
+        let (mut d, mut cpu, mut bus) = setup();
+
+        let pic_frame = 0x300280u32;
+        write_rect(&mut bus, pic_frame, 0, 0, 40, 200);
+        bus.write_long(TEST_SP, pic_frame);
+        cpu.write_reg(Register::A7, TEST_SP);
+        d.dispatch_quickdraw(true, 0x0F3, &mut cpu, &mut bus)
+            .expect("OpenPicture should be handled")
+            .expect("OpenPicture should succeed");
+        let handle = bus.read_long(cpu.read_reg(Register::A7));
+
+        let text = b"Welcome, Human";
+        let buffer = bus.alloc(text.len() as u32);
+        bus.write_bytes(buffer, text);
+        let sp = TEST_SP - 8;
+        bus.write_word(sp, text.len() as u16); // byteCount
+        bus.write_word(sp + 2, 0); // firstByte
+        bus.write_long(sp + 4, buffer); // textBuf
+        cpu.write_reg(Register::A7, sp);
+        d.dispatch_quickdraw(true, 0x085, &mut cpu, &mut bus)
+            .expect("DrawText should be handled")
+            .expect("DrawText should succeed");
+        assert_eq!(
+            cpu.read_reg(Register::A7),
+            sp + 8,
+            "DrawText pops its three arguments whether it draws or records"
+        );
+
+        cpu.write_reg(Register::A7, TEST_SP);
+        d.dispatch_quickdraw(true, 0x0F4, &mut cpu, &mut bus)
+            .expect("ClosePicture should be handled")
+            .expect("ClosePicture should succeed");
+
+        let pic_ptr = bus.read_long(handle);
+        let size = usize::from(bus.read_word(pic_ptr));
+        let picture = bus.read_bytes(pic_ptr, size);
+        // Find the run by its bytes and check the seven in front of it are a
+        // LongText header: opcode $0028, the pen point, then the count.
+        // Searching for the opcode word instead matches picFrame coordinates.
+        let at = picture
+            .windows(text.len())
+            .position(|window| window == text)
+            .expect("the recorded picture should carry the drawn run");
+        assert!(at >= 7, "a LongText header should precede the run");
+        assert_eq!(
+            &picture[at - 7..at - 5],
+            &[0x00, 0x28],
+            "the run should be introduced by the LongText opcode"
+        );
+        assert_eq!(
+            usize::from(picture[at - 1]),
+            text.len(),
+            "the recorded run keeps its byte count"
         );
     }
 
