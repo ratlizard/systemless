@@ -206,6 +206,64 @@ struct Cli {
     /// every time and two builds can be compared on matched work.
     #[arg(long, value_name = "FILE")]
     input_script: Option<PathBuf>,
+    /// Put a MacBinary file into the guest's System Folder:Preferences before
+    /// launch, under the name it carries, replacing any stored copy. May be
+    /// repeated; SYSTEMLESS_PREFERENCES_FILE names one more.
+    #[arg(long, value_name = "FILE")]
+    preferences_file: Vec<PathBuf>,
+}
+
+/// The guest's preferences folder: where an application keeps what it expects
+/// to survive quitting, and so the one place a host has a reason to put a
+/// file the archive did not ship. A file seeded here is read by the
+/// application at launch as its own, and the save store persists whatever
+/// the application writes back, so a seeded file outlives the run it was
+/// given to -- the next launch without the flag still finds it.
+const GUEST_PREFERENCES_DIR: &str = "System Folder/Preferences";
+
+/// The preferences files to seed: the flag's, then the environment's. The
+/// variable exists for scripted runs whose command line is fixed by a
+/// wrapper, the same reason SYSTEMLESS_STANDARD_GET_FILE does.
+fn preference_files_to_seed(from_cli: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files = from_cli.to_vec();
+    if let Some(path) = std::env::var_os("SYSTEMLESS_PREFERENCES_FILE") {
+        if !path.is_empty() {
+            files.push(PathBuf::from(path));
+        }
+    }
+    files
+}
+
+/// Seed the preferences files into the guest, after the save store has
+/// restored what it holds and before the application initialises, so a
+/// seeded file wins over a stored one and the application never sees the
+/// stored one at all. A file that cannot be read or is not MacBinary ends
+/// the run: a flag that silently did nothing is worse than none.
+fn seed_preference_files(runner: &mut FixtureRunner, files: &[PathBuf]) {
+    for path in files {
+        let bytes = std::fs::read(path).unwrap_or_else(|e| {
+            eprintln!(
+                "Error: cannot read preferences file {}: {e}",
+                path.display()
+            );
+            std::process::exit(1);
+        });
+        let file = game::macbinary_vfs_file(&bytes, GUEST_PREFERENCES_DIR).unwrap_or_else(|e| {
+            eprintln!(
+                "Error: {} is not a MacBinary file: {e}",
+                path.display()
+            );
+            std::process::exit(1);
+        });
+        eprintln!(
+            "[SYSTEMLESS] Seeded {} ({} data + {} resource bytes) from {}",
+            file.path,
+            file.data_fork.len(),
+            file.resource_fork.len(),
+            path.display()
+        );
+        runner.import_vfs_file(&file);
+    }
 }
 
 fn parse_screen_depth(value: &str) -> Result<u16, String> {
@@ -777,6 +835,8 @@ struct App {
     runner: Option<FixtureRunner>,
     save_store: Option<DesktopSaveStore>,
     game_path: PathBuf,
+    /// MacBinary files to seed into System Folder/Preferences at boot.
+    preferences_files: Vec<PathBuf>,
     initialized: bool,
     total_instructions: u64,
     /// Wall-clock origin for deriving tick targets.
@@ -928,6 +988,7 @@ impl App {
             scaled_frame: Vec::new(),
             runner: None,
             save_store: None,
+            preferences_files: Vec::new(),
             game_path,
             initialized: false,
             total_instructions: 0,
@@ -1051,6 +1112,7 @@ impl App {
                 restored_saves.len()
             );
         }
+        seed_preference_files(&mut runner, &self.preferences_files);
         game::init_game(&mut runner, &app);
         runner.prepare_text_presentation();
         runner.set_arrows_as_numpad(self.arrows_as_numpad);
@@ -2895,6 +2957,7 @@ fn run_gui(
     display_scale: Option<u32>,
     ui_theme: UiThemeId,
     fullscreen: bool,
+    preferences_files: Vec<PathBuf>,
 ) {
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     eprintln!(
@@ -2916,6 +2979,7 @@ fn run_gui(
         ui_theme,
         fullscreen,
     );
+    app.preferences_files = preferences_files;
     // `run_app` is the first point at which `resumed` can create a native
     // window. Finish archive decompression and guest initialization before
     // entering the event loop so startup never exposes an empty host window.
@@ -3089,6 +3153,7 @@ fn run_headless(
     screen_depth: Option<u16>,
     script: &[ScriptedInput],
     ui_theme: UiThemeId,
+    preferences_files: &[PathBuf],
 ) {
     eprintln!("[HEADLESS] Starting: {}", game_path.display());
     eprintln!("[HEADLESS] Max instructions: {}", max_instructions);
@@ -3114,6 +3179,7 @@ fn run_headless(
             restored_saves.len()
         );
     }
+    seed_preference_files(&mut runner, preferences_files);
     game::init_game(&mut runner, &app);
 
     // Guest-clock cadence for this scripted run.
@@ -3285,6 +3351,7 @@ fn main() {
 
     eprintln!("[SYSTEMLESS] Starting emulator...");
     eprintln!("[SYSTEMLESS] Game: {}", game_path.display());
+    let preferences_files = preference_files_to_seed(&cli.preferences_file);
 
     if cli.headless {
         let script = match cli.input_script.as_deref() {
@@ -3307,6 +3374,7 @@ fn main() {
             cli.screen_depth,
             &script,
             cli.ui_theme,
+            &preferences_files,
         );
     } else {
         if cli.input_script.is_some() {
@@ -3322,6 +3390,7 @@ fn main() {
             cli.display_scale,
             cli.ui_theme,
             cli.fullscreen,
+            preferences_files,
         );
     }
 }
@@ -3731,6 +3800,25 @@ mod tests {
         );
         assert!(parse_input_script("1 patch zz 00\n").is_err());
         assert!(parse_input_script("1 patch 10 abc\n").is_err());
+    }
+
+    #[test]
+    fn cli_collects_every_preferences_file_in_order() {
+        let cli = Cli::try_parse_from([
+            "systemless",
+            "--preferences-file",
+            "a.bin",
+            "--preferences-file",
+            "b.bin",
+            "game.sit",
+        ])
+        .expect("preferences files should parse");
+        assert_eq!(
+            cli.preferences_file,
+            vec![PathBuf::from("a.bin"), PathBuf::from("b.bin")]
+        );
+        let none = Cli::try_parse_from(["systemless", "game.sit"]).expect("no flag is fine");
+        assert!(none.preferences_file.is_empty());
     }
 
     #[test]
